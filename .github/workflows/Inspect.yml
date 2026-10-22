@@ -1,0 +1,14 @@
+name: Inspect
+on: workflow_dispatch
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          for f in Makefile liquidass.plist control NOTICES.md Tweak.x Shared/LGSharedSupport.h Shared/LGSharedSupport.m Shared/LGGlassKit.x LiquidAssRWB/Makefile LiquidAssRWB/LiquidAssRWB.plist LiquidAssRWB/Tweak.x LiquidAssBackboardd/Makefile LiquidAssBackboardd/LiquidAssBackboardd.plist .github/workflows/main.yml; do echo "=== $f"; cat "$f"; done > bundle.txt
+          wc -c bundle.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: bundle.txt
