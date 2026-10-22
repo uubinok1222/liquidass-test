@@ -1,0 +1,755 @@
+name: clockglass
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cut, keep]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      DEVICE_TARGET: "iphone:clang:16.5:14.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: transform source
+        run: |
+          set -euo pipefail
+          echo "== LICENSE =="; head -n 12 LICENSE || true
+          rm -rf changelogs tools release.sh README.md LiquidAssRWB .github/workflows/main.yml
+          if [ "$VARIANT" = "cut" ]; then
+            rm -rf LiquidAssPrefs
+            find Hooks -type f ! -name 'Clock.x' -delete
+          fi
+
+          cat > /tmp/patch.pl <<'PERLEOF'
+          use strict; use warnings;
+          sub slurp { local $/; open my $f, '<', $_[0] or die "open $_[0]: $!"; my $c = <$f>; close $f; return $c; }
+          sub spit { open my $f, '>', $_[0] or die "write $_[0]: $!"; print $f $_[1]; close $f; }
+          sub L { return join("\n", @_); }
+          sub patch {
+            my ($file, $re, $rep, $must) = @_;
+            my $c = slurp($file);
+            my $n = () = $c =~ /$re/g;
+            if ($n == 0) { die "PATCH FAILED: $file :: $re\n" if $must; print "WARN no match: $file :: $re\n"; return 0; }
+            die "PATCH AMBIGUOUS ($n): $file :: $re\n" if $must && $n > 1;
+            $c =~ s/$re/$rep/;
+            spit($file, $c);
+            return 1;
+          }
+
+          my $clock = 'Hooks/Clock.x';
+          patch($clock, qr{#import "\.\./Shared/LGGlassKit\.h"}, L('#import "../Shared/LGGlassKit.h"', '#import "../Shared/XCStyle.h"'), 1);
+          patch($clock, qr{return lgHostEnabled\(\@"Clock"\);}, 'return XCClockStyleGlassOn();', 1);
+          patch($clock, qr{UIView \*host = self\.host;\s*\n\s*if \(!host\.window\) return;},
+            L('UIView *host = self.host;',
+              '    if (!host.window) return;',
+              '    if (!XCHostShouldRender(host)) { if (self.glassView || self.sourceLabel) [self restore]; return; }',
+              '    XCNoteClockHost(host);'), 1);
+          patch($clock, qr{nearestTop,\s*LGClockBezelWidth\(\),}, 'nearestTop, LGClockBezelWidth() + XCStyleSignature(),', 1);
+          patch($clock, qr{CGPathRef normalizedPath = CGPathCreateCopyByTransformingPath\(glyphPath, &transform\);},
+            L('CGPathRef xcBase = CGPathCreateCopyByTransformingPath(glyphPath, &transform);',
+              '                CGAffineTransform xcSt = XCStretchTransform(CGRectGetMinY(sourceRect));',
+              '                CGPathRef normalizedPath = CGPathCreateCopyByTransformingPath(xcBase, &xcSt);',
+              '                CGPathRelease(xcBase);'), 1);
+          patch($clock, qr{glass\.layer\.masksToBounds = NO;}, L('glass.layer.masksToBounds = NO;', '            XCSyncGlassParams(glass);'), 1);
+          patch($clock, qr{if \(!\[NSBundle\.mainBundle\.bundleIdentifier isEqualToString:\@"com\.apple\.springboard"\]\) return;}, 'if (!XCProcessHostsClock()) return;', 1);
+          patch($clock, qr{static void LGClockHostDidMove\(UIView \*host\) \{}, L('static void LGClockHostDidMove(UIView *host) {', '    XCSyncHostTransform(host);'), 1);
+          patch($clock, qr{static void LGClockHostDidLayout\(UIView \*host\) \{}, L('static void LGClockHostDidLayout(UIView *host) {', '    XCSyncHostTransform(host);'), 1);
+
+          my $gk = 'Shared/LGGlassKit.x';
+          patch($gk, qr{BOOL lgHostEnabled\(NSString \*prefix\) \{},
+            L('BOOL lgHostEnabled(NSString *prefix) {',
+              '    if (prefix.length && ![prefix isEqualToString:@"Clock"] && ![prefix isEqualToString:@"Global"]) return NO;'), 1);
+          { my $c = slurp($gk);
+            $c .= "\n" . L('void LGRunReloadHandlersNow(void) {',
+              '    dispatch_async(dispatch_get_main_queue(), ^{',
+              '        LGInvalidateGlassPreferenceCache();',
+              '        lgReconcileInjectionsForDisable();',
+              '        for (void (^handler)(void) in [sReloadHandlers copy]) handler();',
+              '    });', '}') . "\n";
+            spit($gk, $c); }
+
+          my $ss = 'Shared/LGSharedSupport.m';
+          patch($ss, qr{#import "LGSharedSupport\.h"}, L('#import "LGSharedSupport.h"', '#import "XCStyle.h"'), 1);
+          patch($ss, qr{static id LGPreferenceValue\(NSString \*key\) \{\s*\n\s*if \(!key\.length\) return nil;},
+            L('static id LGPreferenceValue(NSString *key) {', '    if (!key.length) return nil;',
+              '    { id xcOv = XCStylePreferenceOverride(key); if (xcOv) return xcOv; }'), 1);
+
+          my $found = 0;
+          for my $f (glob("Shared/*.m Shared/*.x Shared/*.mm")) {
+            my $c = slurp($f);
+            next unless $c =~ /\bid\s+LGGlassPreferenceValue\s*\(\s*NSString\s*\*\s*\w+\s*\)\s*\{/;
+            $c =~ s/(\bid\s+LGGlassPreferenceValue\s*\(\s*NSString\s*\*\s*(\w+)\s*\)\s*\{)/$1\n    { id xcOv = XCStylePreferenceOverride($2); if (xcOv) return xcOv; }/;
+            $c = "#import \"XCStyle.h\"\n" . $c;
+            spit($f, $c); $found = 1; print "patched GlassPreferenceValue in $f\n";
+          }
+          print "WARN: LGGlassPreferenceValue not found\n" unless $found;
+
+          patch('Tweak.x', qr{message:\@"Liquid \(Gl\)ass has detected[^"]*"},
+            'message:@"ClockGlass detected a backboardd crash loop and turned its core off. Tap Exit Safe Mode to try again."', 0);
+          print "patches done\n";
+          PERLEOF
+          perl /tmp/patch.pl
+
+          find . -depth -name 'LG*' -not -path './.git/*' | while read -r p; do d=$(dirname "$p"); b=$(basename "$p"); mv "$p" "$d/XC${b#LG}"; done
+          mv LiquidAssBackboardd ClockGlassBackboardd
+          mv ClockGlassBackboardd/LiquidAssBackboardd.plist ClockGlassBackboardd/ClockGlassBackboardd.plist
+          rm -f liquidass.plist
+          find . -type f \( -name '*.x' -o -name '*.xm' -o -name '*.m' -o -name '*.mm' -o -name '*.h' -o -name 'Makefile' \) -not -path './.git/*' -not -path './.github/*' -print0 | xargs -0 perl -pi -e 's/dylv\.liquidassprefs/xc.clockglass.prefs/g; s/dylv\.liquidglass/xc.clockglass/g; s/dylv\.liquidass/xc.clockglass/g; s/liquidglass-clock-mask-shared/clockglass-clock-mask/g; s/liquidass-backboardd/clockglass-backboardd/g; s/liquidass-safemode/clockglass-safemode/g; s/liquidglass\.log/clockglass.log/g; s/LiquidAssBackboardd/ClockGlassBackboardd/g; s/Liquid \(Gl\)ass/ClockGlass/g; s/LiquidAss(?!Prefs)/ClockGlass/g; s/(?<![A-Za-z0-9])([ks]?)LG(?=[A-Za-z0-9_])/${1}XC/g; s/(?<![A-Za-z0-9])lg(?=[A-Z])/xc/g;'
+
+          cat > Shared/XCStyle.h <<'XCEOF'
+          #pragma once
+          #import <UIKit/UIKit.h>
+          #define XC_STRETCH_MAX 0.8
+          typedef struct { BOOL valid; BOOL glass; double stretch; double clarity; double distortion; } XCStyleValue;
+          BOOL XCClockStyleGlassOn(void);
+          double XCStyleSignature(void);
+          id XCStylePreferenceOverride(NSString *key);
+          BOOL XCProcessHostsClock(void);
+          BOOL XCHostShouldRender(UIView *host);
+          void XCSyncHostTransform(UIView *host);
+          void XCNoteClockHost(UIView *host);
+          void XCSyncGlassParams(id glass);
+          CGAffineTransform XCStretchTransform(CGFloat anchorY);
+          void XCStyleDidChange(void);
+          void XCSetActivePosterVC(UIViewController *vc);
+          void XCEditBegin(NSUUID *uuid);
+          void XCEditEnd(void);
+          BOOL XCEditActive(void);
+          XCStyleValue XCEditGet(void);
+          void XCEditSet(XCStyleValue v);
+          void XCEditCommit(void);
+          void XCLogf(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+          XCEOF
+
+          cat > Shared/XCStyle.m <<'XCEOF'
+          #import "XCStyle.h"
+          #import "XCLiveBackdropView.h"
+          #import <objc/runtime.h>
+          #import <notify.h>
+          #include <uuid/uuid.h>
+          #include <string.h>
+          #include <stdarg.h>
+
+          extern void XCInvalidateGlassPreferenceCache(void);
+          extern void XCRunReloadHandlersNow(void);
+
+          #define kSetName "com.clockglass.style.set"
+          #define kDefClarity 0.75
+          #define kDefDistortion 0.5
+
+          static NSMutableDictionary *sCfg;
+          static XCStyleValue sCurrent, sEdit, sEditInit;
+          static __weak UIViewController *sPosterVC;
+          static BOOL sEditing;
+          static uint32_t sEditHash;
+          static NSString *sTintHex = @"#FFFFFF4C";
+          static char kGlassSigKey, kHiddenKey;
+
+          static BOOL IsSB(void) {
+              static BOOL v; static dispatch_once_t once;
+              dispatch_once(&once, ^{ v = [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"]; });
+              return v;
+          }
+          static XCStyleValue DefStyle(void) {
+              XCStyleValue s = { NO, NO, -1, kDefClarity, kDefDistortion };
+              return s;
+          }
+
+          void XCLogf(NSString *fmt, ...) {
+              va_list ap; va_start(ap, fmt);
+              NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+              va_end(ap);
+              NSString *proc = NSProcessInfo.processInfo.processName;
+              NSData *d = [[NSString stringWithFormat:@"[%@] %@\n", proc, s] dataUsingEncoding:NSUTF8StringEncoding];
+              for (NSString *dir in @[@"/var/mobile/Library/Caches", NSTemporaryDirectory()]) {
+                  NSString *p = [dir stringByAppendingFormat:@"/clockglass_%@.log", proc];
+                  NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+                  if (!h) { [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; h = [NSFileHandle fileHandleForWritingAtPath:p]; }
+                  if (!h) continue;
+                  if ([h seekToEndOfFile] < 200000) [h writeData:d];
+                  [h closeFile];
+                  return;
+              }
+          }
+
+          static NSString *CfgPath(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences/com.clockglass.styles.plist"]; }
+          static void CfgLoad(void) { sCfg = [NSMutableDictionary dictionaryWithContentsOfFile:CfgPath()] ?: [NSMutableDictionary new]; }
+          static void CfgSave(void) { [sCfg writeToFile:CfgPath() atomically:YES]; }
+          static NSString *Hex(uint32_t h) { return [NSString stringWithFormat:@"%08x", h]; }
+          static uint32_t HashUUID(NSUUID *u) {
+              uuid_t b; [u getUUIDBytes:b];
+              uint32_t w[4]; memcpy(w, b, 16);
+              return w[0] ^ w[1] ^ w[2] ^ w[3];
+          }
+          static XCStyleValue FromDict(NSDictionary *c) {
+              XCStyleValue s = DefStyle();
+              if (![c isKindOfClass:NSDictionary.class]) return s;
+              s.valid = YES;
+              s.glass = [c[@"g"] boolValue];
+              double st = c[@"s"] ? [c[@"s"] doubleValue] : -1;
+              s.stretch = st < 0 ? -1 : MIN(1.0, st);
+              if (c[@"c"]) s.clarity = MIN(1.0, MAX(0.0, [c[@"c"] doubleValue]));
+              if (c[@"d"]) s.distortion = MIN(1.0, MAX(0.0, [c[@"d"] doubleValue]));
+              return s;
+          }
+          static NSUUID *UUIDFromCfgKey(UIViewController *vc, NSString *key) {
+              @try {
+                  id cfg = [vc valueForKey:key];
+                  SEL s = NSSelectorFromString(@"pr_posterUUID");
+                  if (cfg && [cfg respondsToSelector:s]) {
+                      id u = [cfg performSelector:s];
+                      if ([u isKindOfClass:NSUUID.class]) return u;
+                  }
+              } @catch (...) {}
+              return nil;
+          }
+          static void Recompute(void) {
+              if (sEditing) { sCurrent = sEdit; return; }
+              UIViewController *vc = sPosterVC;
+              NSUUID *u = vc ? UUIDFromCfgKey(vc, @"_configuration") : nil;
+              sCurrent = u ? FromDict(sCfg[Hex(HashUUID(u))]) : DefStyle();
+          }
+
+          void XCStyleDidChange(void) {
+              static BOOL pending;
+              if (pending) return;
+              pending = YES;
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 33 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                  pending = NO;
+                  XCRunReloadHandlersNow();
+              });
+          }
+          void XCSetActivePosterVC(UIViewController *vc) {
+              sPosterVC = vc; Recompute(); XCStyleDidChange();
+              XCLogf(@"poster appeared valid=%d glass=%d stretch=%.2f", sCurrent.valid, sCurrent.glass, sCurrent.stretch);
+          }
+
+          BOOL XCClockStyleGlassOn(void) { return sCurrent.valid && sCurrent.glass; }
+          double XCStyleSignature(void) {
+              if (!sCurrent.valid) return 0;
+              return (sCurrent.stretch >= 0 ? lround(sCurrent.stretch * 100) : 0) + lround(sCurrent.clarity * 100) * 1000.0
+                   + lround(sCurrent.distortion * 100) * 1000000.0 + (sCurrent.glass ? 1e9 : 0);
+          }
+          CGAffineTransform XCStretchTransform(CGFloat anchorY) {
+              if (!(sCurrent.valid && sCurrent.glass && sCurrent.stretch >= 0)) return CGAffineTransformIdentity;
+              CGFloat sc = 1.0 + XC_STRETCH_MAX * sCurrent.stretch;
+              return CGAffineTransformMake(1, 0, 0, sc, 0, anchorY * (1.0 - sc));
+          }
+
+          id XCStylePreferenceOverride(NSString *key) {
+              if (!key.length) return nil;
+              if ([key isEqualToString:@"Global.Enabled"]) return @YES;
+              if (![key hasPrefix:@"Clock."] && ![key hasPrefix:@"Lockscreen.Clock."]) return nil;
+              if ([key isEqualToString:@"Clock.VariableFont.Enabled"]) return @NO;
+              if ([key isEqualToString:@"Lockscreen.Clock.DateFormat.Enabled"]) return @NO;
+              if (!sCurrent.valid) return nil;
+              if ([key isEqualToString:@"Clock.Blur"]) return @(8.0 * (1.0 - sCurrent.clarity));
+              if ([key isEqualToString:@"Clock.BezelWidth"]) return @(4.0 + 16.0 * sCurrent.distortion);
+              if ([key isEqualToString:@"Clock.RefractionScale"]) return @(0.8 + 1.6 * sCurrent.distortion);
+              if ([key isEqualToString:@"Clock.LightTintColor"] || [key isEqualToString:@"Clock.DarkTintColor"]) return sTintHex;
+              return nil;
+          }
+
+          BOOL XCProcessHostsClock(void) {
+              if (IsSB()) return YES;
+              return NSClassFromString(@"PREditingFontAndColorPickerViewController") != nil && NSClassFromString(@"CSProminentTimeView") != nil;
+          }
+
+          BOOL XCHostShouldRender(UIView *host) {
+              if (IsSB()) return YES;
+              UIWindow *w = host.window;
+              if (!w) return NO;
+              if (!CGRectIntersectsRect([host convertRect:host.bounds toView:nil], w.bounds)) return NO;
+              UIView *dv = host;
+              while (dv && ![NSStringFromClass(dv.class) isEqualToString:@"CSProminentDisplayView"]) dv = dv.superview;
+              if (!dv || !dv.superview) return YES;
+              for (UIView *s in dv.superview.subviews.reverseObjectEnumerator) {
+                  if (![NSStringFromClass(s.class) isEqualToString:@"CSProminentDisplayView"]) continue;
+                  if (CGRectIntersectsRect([s convertRect:s.bounds toView:nil], w.bounds)) return s == dv;
+              }
+              return YES;
+          }
+
+          void XCSyncHostTransform(UIView *host) {
+              XCStyleValue s = sCurrent;
+              CGAffineTransform want = CGAffineTransformIdentity;
+              if (s.valid && !s.glass && s.stretch >= 0) {
+                  CGFloat sc = 1.0 + XC_STRETCH_MAX * s.stretch, h = host.bounds.size.height;
+                  want = CGAffineTransformMake(1, 0, 0, sc, 0, (sc - 1) * h / 2);
+              }
+              if (!CGAffineTransformEqualToTransform(host.transform, want)) host.transform = want;
+              BOOL hideDup = s.valid && s.glass && !XCHostShouldRender(host);
+              BOOL did = [objc_getAssociatedObject(host, &kHiddenKey) boolValue];
+              if (hideDup && !did) { host.alpha = 0; objc_setAssociatedObject(host, &kHiddenKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+              else if (!hideDup && did) { host.alpha = 1; objc_setAssociatedObject(host, &kHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+          }
+
+          void XCNoteClockHost(UIView *host) {
+              UIColor *c = nil;
+              for (UIResponder *r = host; r; r = r.nextResponder) {
+                  if ([NSStringFromClass(r.class) isEqualToString:@"CSProminentDisplayViewController"]) {
+                      @try { id v = [r valueForKey:@"_textColor"]; if ([v isKindOfClass:UIColor.class]) c = v; } @catch (...) {}
+                      break;
+                  }
+              }
+              if (!c) return;
+              CGFloat cr = 1, cg = 1, cb = 1, ca = 1;
+              if (![c getRed:&cr green:&cg blue:&cb alpha:&ca]) {
+                  CGFloat w = 1;
+                  if ([c getWhite:&w alpha:&ca]) { cr = cg = cb = w; } else return;
+              }
+              double alpha = 0.05 + 0.5 * (1.0 - sCurrent.clarity);
+              sTintHex = [NSString stringWithFormat:@"#%02X%02X%02X%02X", (int)lround(cr * 255), (int)lround(cg * 255), (int)lround(cb * 255), (int)lround(alpha * 255)];
+          }
+
+          void XCSyncGlassParams(id glass) {
+              if (!glass) return;
+              NSString *sig = [NSString stringWithFormat:@"%.3f|%.3f|%@", sCurrent.clarity, sCurrent.distortion, sTintHex];
+              if ([sig isEqualToString:objc_getAssociatedObject(glass, &kGlassSigKey)]) return;
+              objc_setAssociatedObject(glass, &kGlassSigKey, sig, OBJC_ASSOCIATION_COPY_NONATOMIC);
+              XCInvalidateGlassPreferenceCache();
+              if ([glass respondsToSelector:@selector(applyFilters)]) [glass applyFilters];
+          }
+
+          static void Send(uint32_t h, XCStyleValue v) {
+              static int tok = 0; static dispatch_once_t once;
+              dispatch_once(&once, ^{ notify_register_check(kSetName, &tok); });
+              uint64_t sc = v.stretch < 0 ? 0 : (uint64_t)(MIN(100, lround(v.stretch * 100)) + 1);
+              uint64_t cp = (uint64_t)MIN(100, MAX(0, lround(v.clarity * 100)));
+              uint64_t dp = (uint64_t)MIN(100, MAX(0, lround(v.distortion * 100)));
+              uint64_t st = ((uint64_t)h << 32) | ((uint64_t)(v.glass ? 1 : 0) << 31) | (sc << 24) | (0xA5ULL << 16) | (cp << 8) | dp;
+              uint32_t r1 = notify_set_state(tok, st), r2 = notify_post(kSetName);
+              XCLogf(@"send hash=%08x glass=%d s=%.2f c=%.2f d=%.2f r=%u/%u", h, v.glass, v.stretch, v.clarity, v.distortion, r1, r2);
+          }
+
+          void XCEditBegin(NSUUID *uuid) {
+              sEditing = (uuid != nil);
+              sEditHash = uuid ? HashUUID(uuid) : 0;
+              XCStyleValue base = uuid ? FromDict(sCfg[Hex(sEditHash)]) : DefStyle();
+              sEditInit = base; sEdit = base;
+              Recompute(); XCStyleDidChange();
+              XCLogf(@"edit begin uuid=%@ valid=%d", uuid.UUIDString, base.valid);
+          }
+          void XCEditEnd(void) { sEditing = NO; Recompute(); XCStyleDidChange(); }
+          BOOL XCEditActive(void) { return sEditing; }
+          XCStyleValue XCEditGet(void) { return sEdit; }
+          void XCEditSet(XCStyleValue v) { v.valid = YES; sEdit = v; Recompute(); XCStyleDidChange(); }
+          void XCEditCommit(void) {
+              if (!sEditing || !sEdit.valid) return;
+              if (sEditInit.valid && sEdit.glass == sEditInit.glass && fabs(sEdit.stretch - sEditInit.stretch) < 0.005
+                  && fabs(sEdit.clarity - sEditInit.clarity) < 0.005 && fabs(sEdit.distortion - sEditInit.distortion) < 0.005) return;
+              sCfg[Hex(sEditHash)] = @{ @"g": @(sEdit.glass), @"s": @(sEdit.stretch), @"c": @(sEdit.clarity), @"d": @(sEdit.distortion) };
+              CfgSave();
+              Send(sEditHash, sEdit);
+              sEditInit = sEdit;
+          }
+
+          static void StartReceiver(void) {
+              static int tok = 0;
+              uint32_t r = notify_register_dispatch(kSetName, &tok, dispatch_get_main_queue(), ^(int t) {
+                  uint64_t st = 0; notify_get_state(t, &st);
+                  if (((st >> 16) & 0xFF) != 0xA5) return;
+                  uint32_t h = (uint32_t)(st >> 32);
+                  BOOL g = (st >> 31) & 1;
+                  int code = (int)((st >> 24) & 0x7F);
+                  double s = code > 0 ? (code - 1) / 100.0 : -1.0;
+                  double c = ((st >> 8) & 0x7F) / 100.0, d = (st & 0x7F) / 100.0;
+                  sCfg[Hex(h)] = @{ @"g": @(g), @"s": @(s), @"c": @(c), @"d": @(d) };
+                  CfgSave(); Recompute(); XCRunReloadHandlersNow();
+                  XCLogf(@"recv hash=%08x glass=%d s=%.2f c=%.2f d=%.2f", h, g, s, c, d);
+              });
+              XCLogf(@"receiver r=%u", r);
+          }
+
+          __attribute__((constructor)) static void XCStyleInit(void) {
+              @autoreleasepool {
+                  CfgLoad();
+                  if (!IsSB()) return;
+                  CFStringRef dom = CFSTR("xc.clockglass.prefs");
+                  CFPropertyListRef cur = CFPreferencesCopyAppValue(CFSTR("Global.Enabled"), dom);
+                  if (!cur) { CFPreferencesSetAppValue(CFSTR("Global.Enabled"), kCFBooleanTrue, dom); CFPreferencesAppSynchronize(dom); }
+                  else CFRelease(cur);
+                  StartReceiver();
+              }
+          }
+          XCEOF
+
+          cat > Hooks/XCEditor.x <<'XCEOF'
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+          #import "../Shared/XCStyle.h"
+          #import "../Shared/XCGlassKit.h"
+
+          @interface XCUI : NSObject
+          @property (nonatomic, weak) UIView *root;
+          @property (nonatomic, weak) UIView *handle;
+          @property (nonatomic, weak) UISwitch *sw;
+          @property (nonatomic, weak) UISlider *clarity;
+          @property (nonatomic, weak) UISlider *distortion;
+          @property (nonatomic) double panStart;
+          @property (nonatomic) CGFloat hostH;
+          @property (nonatomic) BOOL hasButtons;
+          @property (nonatomic) BOOL settled;
+          @end
+
+          static XCUI *gUI;
+          static const void *kRootKey = &kRootKey;
+          static const void *kPanelKey = &kPanelKey;
+
+          @implementation XCUI
+          - (void)tail { if (self.settled && !self.hasButtons) XCEditCommit(); }
+          - (void)switched { XCStyleValue v = XCEditGet(); v.glass = self.sw.isOn; XCEditSet(v); [self tail]; }
+          - (void)slid { XCStyleValue v = XCEditGet(); v.clarity = self.clarity.value; v.distortion = self.distortion.value; XCEditSet(v); }
+          - (void)done { XCEditCommit(); }
+          - (void)cancel { XCEditEnd(); }
+          - (void)pan:(UIPanGestureRecognizer *)g {
+              UIView *root = self.root; if (!root) return;
+              XCStyleValue v = XCEditGet();
+              if (g.state == UIGestureRecognizerStateBegan) self.panStart = v.stretch >= 0 ? v.stretch : 0;
+              CGFloat h = self.hostH > 1 ? self.hostH : 119;
+              double s = self.panStart + [g translationInView:root].y / (XC_STRETCH_MAX * h);
+              v.stretch = MAX(0.0, MIN(1.0, s));
+              XCEditSet(v);
+              if (g.state == UIGestureRecognizerStateEnded) [self tail];
+          }
+          @end
+
+          static BOOL IsClass(UIView *v, NSString *n) { return [NSStringFromClass(v.class) isEqualToString:n]; }
+          static UIView *FindView(UIView *root, BOOL (^pred)(UIView *)) {
+              NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:root]; NSUInteger i = 0;
+              while (i < q.count && i < 4000) {
+                  UIView *v = q[i++];
+                  if (pred(v)) return v;
+                  [q addObjectsFromArray:v.subviews];
+              }
+              return nil;
+          }
+
+          static id Call(id o, NSString *sel) { SEL s = NSSelectorFromString(sel); return [o respondsToSelector:s] ? [o performSelector:s] : nil; }
+          static NSUUID *UUIDFrom(id o) {
+              if (!o || [o isKindOfClass:NSUUID.class]) return nil;
+              for (NSString *s in @[@"pr_posterUUID", @"posterUUID"]) { id u = Call(o, s); if ([u isKindOfClass:NSUUID.class]) return u; }
+              id ident = Call(o, @"identity");
+              if (ident) { id u = Call(ident, @"posterUUID"); if ([u isKindOfClass:NSUUID.class]) return u; }
+              return nil;
+          }
+          static BOOL Interesting(id o) {
+              if ([o isKindOfClass:UIView.class] || [o isKindOfClass:CALayer.class]) return NO;
+              if ([o isKindOfClass:UIViewController.class] || [o isKindOfClass:NSArray.class]) return YES;
+              NSString *n = NSStringFromClass([o class]);
+              return [n hasPrefix:@"PR"] || [n hasPrefix:@"PBF"] || [n hasPrefix:@"PF"] || [n hasPrefix:@"PU"] || [n hasPrefix:@"Poster"] || [n hasPrefix:@"_TtC"] || [n containsString:@"Wallpaper"];
+          }
+          static void Neighbors(id o, NSMutableArray *out) {
+              if ([o isKindOfClass:NSArray.class]) { NSUInteger i = 0; for (id x in (NSArray *)o) { if (i++ > 40) break; [out addObject:x]; } return; }
+              if ([o isKindOfClass:UIViewController.class]) {
+                  UIViewController *vc = o;
+                  if (vc.parentViewController) [out addObject:vc.parentViewController];
+                  if (vc.presentingViewController) [out addObject:vc.presentingViewController];
+                  if (vc.presentedViewController) [out addObject:vc.presentedViewController];
+                  [out addObjectsFromArray:vc.childViewControllers];
+              }
+              for (Class k = [o class]; k && k != NSObject.class && k != UIResponder.class && k != UIViewController.class; k = class_getSuperclass(k)) {
+                  unsigned n = 0; Ivar *iv = class_copyIvarList(k, &n);
+                  for (unsigned i = 0; i < n; i++) {
+                      const char *te = ivar_getTypeEncoding(iv[i]);
+                      if (!te || te[0] != '@') continue;
+                      id v = nil; @try { v = object_getIvar(o, iv[i]); } @catch (...) {}
+                      if (v) [out addObject:v];
+                  }
+                  free(iv);
+              }
+          }
+          static NSUUID *FindPosterUUID(id root) {
+              NSMutableArray *queue = [NSMutableArray arrayWithObject:root], *depths = [NSMutableArray arrayWithObject:@0];
+              NSMutableSet *seen = [NSMutableSet set]; NSUInteger idx = 0;
+              while (idx < queue.count && idx < 400) {
+                  id o = queue[idx]; int d = [depths[idx] intValue]; idx++;
+                  NSValue *key = [NSValue valueWithNonretainedObject:o];
+                  if ([seen containsObject:key]) continue;
+                  [seen addObject:key];
+                  NSUUID *u = UUIDFrom(o); if (u) return u;
+                  if (d >= 5 || !Interesting(o)) continue;
+                  NSMutableArray *nb = [NSMutableArray array]; Neighbors(o, nb);
+                  for (id x in nb) { [queue addObject:x]; [depths addObject:@(d + 1)]; }
+              }
+              return nil;
+          }
+
+          static UIView *FindActiveHost(UIWindow *w) {
+              return FindView(w, ^BOOL(UIView *v) { return IsClass(v, @"CSProminentTimeView") && XCHostShouldRender(v); });
+          }
+          static void Reposition(void) {
+              XCUI *ui = gUI; UIView *root = ui.root;
+              if (!ui || !ui.handle || !root.window) return;
+              UIView *host = FindActiveHost(root.window);
+              if (!host) { ui.handle.hidden = YES; return; }
+              XCStyleValue v = XCEditGet();
+              CGFloat sc = (v.valid && v.stretch >= 0) ? 1.0 + XC_STRETCH_MAX * v.stretch : 1.0;
+              CGFloat h = host.bounds.size.height; ui.hostH = h;
+              CGPoint tl = [host convertPoint:CGPointZero toView:root];
+              CGPoint tr = [host convertPoint:CGPointMake(host.bounds.size.width, 0) toView:root];
+              ui.handle.hidden = !XCEditActive();
+              ui.handle.center = CGPointMake(MIN(tr.x - 10, root.bounds.size.width - 24), MIN(tl.y + h * sc + 8, root.bounds.size.height - 120));
+              [root bringSubviewToFront:ui.handle];
+          }
+          static void SyncAll(void) {
+              for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                  NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w]; NSUInteger i = 0;
+                  while (i < q.count && i < 4000) {
+                      UIView *v = q[i++];
+                      if (IsClass(v, @"CSProminentTimeView")) XCSyncHostTransform(v);
+                      [q addObjectsFromArray:v.subviews];
+                  }
+              }
+              Reposition();
+          }
+
+          static void InstallHandle(XCUI *ui, UIView *root) {
+              UIView *h = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
+              UIView *c = [[UIView alloc] initWithFrame:CGRectMake(9, 9, 30, 30)];
+              c.backgroundColor = UIColor.whiteColor; c.layer.cornerRadius = 15; c.userInteractionEnabled = NO;
+              c.layer.shadowColor = UIColor.blackColor.CGColor; c.layer.shadowOpacity = 0.35; c.layer.shadowRadius = 4; c.layer.shadowOffset = CGSizeMake(0, 2);
+              UIImageView *iv = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"arrow.up.and.down"]];
+              iv.tintColor = UIColor.blackColor; iv.frame = CGRectInset(c.bounds, 7, 7); iv.contentMode = UIViewContentModeScaleAspectFit;
+              [c addSubview:iv]; [h addSubview:c];
+              [h addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:ui action:@selector(pan:)]];
+              [root addSubview:h];
+              ui.handle = h;
+          }
+
+          static void HookButtons(XCUI *ui, int attempt) {
+              UIWindow *w = ui.root.window;
+              UIView *done = nil, *cancel = nil;
+              if (w) {
+                  done = FindView(w, ^BOOL(UIView *v) { return IsClass(v, @"PREditingDoneButton") && v.window && !v.isHidden; });
+                  cancel = FindView(w, ^BOOL(UIView *v) { return IsClass(v, @"PREditingCancelButton") && v.window && !v.isHidden; });
+              }
+              if (done && cancel) {
+                  [(UIControl *)done addTarget:ui action:@selector(done) forControlEvents:UIControlEventTouchUpInside];
+                  [(UIControl *)cancel addTarget:ui action:@selector(cancel) forControlEvents:UIControlEventTouchUpInside];
+                  ui.hasButtons = YES; ui.settled = YES;
+                  XCLogf(@"buttons hooked");
+                  return;
+              }
+              if (attempt < 4) {
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ if (gUI == ui) HookButtons(ui, attempt + 1); });
+                  return;
+              }
+              ui.settled = YES;
+              XCLogf(@"buttons NOT found -> commit on change");
+          }
+
+          static void RootAppeared(UIViewController *vc) {
+              if (objc_getAssociatedObject(vc, kRootKey)) return;
+              NSUUID *uuid = FindPosterUUID(vc);
+              XCEditBegin(uuid);
+              XCUI *ui = [XCUI new]; gUI = ui; ui.root = vc.view;
+              objc_setAssociatedObject(vc, kRootKey, ui, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+              InstallHandle(ui, vc.view);
+              HookButtons(ui, 0);
+              Reposition();
+              XCLogf(@"root appeared uuid=%@", uuid.UUIDString ?: @"(none)");
+          }
+          static void RootGone(UIViewController *vc) {
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                  if (vc.viewIfLoaded.window) return;
+                  XCUI *ui = objc_getAssociatedObject(vc, kRootKey);
+                  if (!ui) return;
+                  [ui.handle removeFromSuperview];
+                  objc_setAssociatedObject(vc, kRootKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                  if (gUI == ui) gUI = nil;
+                  XCEditEnd();
+              });
+          }
+
+          static UILabel *Lbl(NSString *t) {
+              UILabel *l = [UILabel new]; l.text = t; l.textColor = UIColor.labelColor;
+              l.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+              [l setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+              [l setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+              return l;
+          }
+          static UISlider *Sld(double val, BOOL en) {
+              UISlider *s = [UISlider new]; s.minimumValue = 0; s.maximumValue = 1; s.value = (float)val; s.enabled = en; return s;
+          }
+          static void InstallPanel(UIViewController *vc) {
+              @try {
+                  if (objc_getAssociatedObject(vc, kPanelKey)) return;
+                  XCUI *ui = gUI; if (!ui) return;
+                  UIStackView *rs = nil;
+                  @try { rs = [vc valueForKey:@"rootStackView"]; } @catch (...) {}
+                  if (![rs isKindOfClass:UIStackView.class]) return;
+                  XCStyleValue v = XCEditGet(); BOOL en = XCEditActive();
+                  UISwitch *sw = [UISwitch new]; sw.on = v.valid && v.glass; sw.enabled = en;
+                  UISlider *cl = Sld(v.clarity, en), *ds = Sld(v.distortion, en);
+                  ui.sw = sw; ui.clarity = cl; ui.distortion = ds;
+                  [sw addTarget:ui action:@selector(switched) forControlEvents:UIControlEventValueChanged];
+                  [cl addTarget:ui action:@selector(slid) forControlEvents:UIControlEventValueChanged];
+                  [ds addTarget:ui action:@selector(slid) forControlEvents:UIControlEventValueChanged];
+                  UIControlEvents up = UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel;
+                  [cl addTarget:ui action:@selector(tail) forControlEvents:up];
+                  [ds addTarget:ui action:@selector(tail) forControlEvents:up];
+                  UIStackView *hs = [[UIStackView alloc] initWithArrangedSubviews:@[Lbl(@"Glass"), sw, Lbl(@"Trong"), cl, Lbl(@"Biến dạng"), ds]];
+                  hs.axis = UILayoutConstraintAxisHorizontal; hs.alignment = UIStackViewAlignmentCenter; hs.spacing = 8;
+                  hs.translatesAutoresizingMaskIntoConstraints = NO;
+                  UIView *row = [UIView new]; [row addSubview:hs];
+                  NSLayoutConstraint *ht = [row.heightAnchor constraintEqualToConstant:40]; ht.priority = 999;
+                  [NSLayoutConstraint activateConstraints:@[ht,
+                      [hs.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:23],
+                      [hs.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-23],
+                      [hs.centerYAnchor constraintEqualToAnchor:row.centerYAnchor]]];
+                  [cl.widthAnchor constraintEqualToAnchor:ds.widthAnchor].active = YES;
+                  [rs addArrangedSubview:row];
+                  rs.spacing = MIN(rs.spacing, 6.0);
+                  objc_setAssociatedObject(vc, kPanelKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                  [rs setNeedsLayout]; [vc.view setNeedsLayout];
+              } @catch (NSException *e) { XCLogf(@"panel exception %@", e); }
+          }
+
+          %group SBGroup
+          %hook PBUIPosterViewController
+          - (void)viewDidAppear:(BOOL)a { %orig; XCSetActivePosterVC((UIViewController *)self); }
+          %end
+          %end
+
+          %group EditorGroup
+          %hook PREditorRootViewController
+          - (void)viewDidAppear:(BOOL)a { %orig; RootAppeared((UIViewController *)self); }
+          - (void)viewDidDisappear:(BOOL)a { %orig; RootGone((UIViewController *)self); }
+          - (void)viewDidLayoutSubviews { %orig; Reposition(); }
+          %end
+          %hook PREditingFontAndColorPickerViewController
+          - (void)viewDidAppear:(BOOL)a { %orig; InstallPanel((UIViewController *)self); }
+          %end
+          %end
+
+          static BOOL gInitSB, gInitEd;
+          static void TryInit(BOOL sb, int n) {
+              if (sb) { if (!gInitSB && objc_getClass("PBUIPosterViewController")) { gInitSB = YES; %init(SBGroup); XCLogf(@"init SBGroup"); } }
+              else if (!gInitEd && objc_getClass("PREditorRootViewController") && objc_getClass("PREditingFontAndColorPickerViewController")) { gInitEd = YES; %init(EditorGroup); XCLogf(@"init EditorGroup"); }
+              BOOL done = sb ? gInitSB : gInitEd;
+              if (!done && n < 15) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ TryInit(sb, n + 1); });
+          }
+
+          %ctor {
+              @autoreleasepool {
+                  BOOL sb = [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"];
+                  xcObservePreferenceReload(^{ SyncAll(); });
+                  TryInit(sb, 0);
+              }
+          }
+          XCEOF
+
+          cat > Makefile <<'XCEOF'
+          export TARGET := iphone:clang:16.5:14.0
+          export ARCHS := arm64 arm64e
+          export USE_DEPS := 1
+          THEOS_PACKAGE_SCHEME ?= roothide
+
+          CCACHE := $(shell command -v ccache 2>/dev/null)
+          export TARGET_CC := $(CCACHE) $(shell xcrun -f clang)
+          export TARGET_CXX := $(CCACHE) $(shell xcrun -f clang++)
+
+          INSTALL_TARGET_PROCESSES = backboardd SpringBoard
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = clockglass
+
+          clockglass_FILES = Tweak.x $(wildcard Hooks/*.x) $(wildcard Shared/*.[xm])
+          XCEXTRA
+          clockglass_CFLAGS = -fobjc-arc
+          clockglass_USE_MODULES = 0
+          clockglass_FRAMEWORKS = UIKit QuartzCore CoreText CoreGraphics CoreMotion
+          ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+          clockglass_LIBRARIES += roothide
+          endif
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          SUBPROJECTS += ClockGlassBackboardd
+          include $(THEOS_MAKE_PATH)/aggregate.mk
+          XCEOF
+          if [ "$VARIANT" = "keep" ]; then
+            perl -pi -e 's/^XCEXTRA$/clockglass_FILES += \$(wildcard LiquidAssPrefs\/XCPrefsLiquid*.m)/' Makefile
+          else
+            perl -pi -e 's/^XCEXTRA\n//' Makefile
+          fi
+
+          cat > control <<'XCEOF'
+          Package: xc.clockglass
+          Name: ClockGlass
+          Version: 0.3.0
+          Architecture: iphoneos-arm
+          Description: Per-wallpaper lock screen clock stretch and glass (based on Liquid (Gl)ass by dylv)
+          Maintainer: you
+          Author: you
+          Section: Tweaks
+          Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
+          XCEOF
+
+          cat > clockglass.plist <<'XCEOF'
+          { Filter = { Executables = ( "SpringBoard" ); Classes = ( "PREditingFontAndColorPickerViewController" ); }; }
+          XCEOF
+
+          cat > NOTICES.md <<'XCEOF'
+          # Notices
+          ClockGlass is based on Liquid (Gl)ass by dylv (winaviation-tweaks/liquidass). See LICENSE for the upstream license terms. Modified: reduced to the lock screen clock, per-wallpaper styles, editor controls, identifiers renamed.
+          XCEOF
+
+          echo "== leftover dylv =="; grep -rIn "dylv" . 2>/dev/null | grep -v '^./.git/' | grep -v LICENSE | grep -v NOTICES | head -20 || true
+          echo "== tree =="; find . -type f -not -path './.git/*' | sort | head -80
+          zip -qr /tmp/source.zip . -x '.git/*'
+
+      - name: upload transformed source
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ matrix.variant }}
+          path: /tmp/source.zip
+
+      - name: setup theos
+        uses: actions/checkout@v4
+        with:
+          repository: roothide/theos
+          path: theos
+          submodules: recursive
+
+      - name: cache sdks
+        id: cache-sdks
+        uses: actions/cache@v4
+        with:
+          path: theos/sdks
+          key: theos-sdks-16.5
+
+      - name: download sdks
+        if: steps.cache-sdks.outputs.cache-hit != 'true'
+        run: |
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mkdir -p theos/sdks
+          mv sdks-master/*.sdk theos/sdks/
+          rm -rf master.zip sdks-master
+
+      - name: env
+        run: echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+
+      - name: deps
+        run: |
+          brew install ldid make
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+
+      - name: build
+        run: |
+          make clean || true
+          make package ARCHS="arm64 arm64e" TARGET="$DEVICE_TARGET" FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+
+      - name: upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.variant }}
+          path: packages/*.deb
