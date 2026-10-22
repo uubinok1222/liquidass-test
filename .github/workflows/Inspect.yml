@@ -1,5 +1,10 @@
 name: Inspect
-on: workflow_dispatch
+
+on:
+  push:
+    branches: [ "main", "master" ] # Tự động chạy khi push lên nhánh main hoặc master (bạn có thể đổi tên nhánh cho khớp với repo của mình)
+  workflow_dispatch: # Vẫn giữ nút chạy thủ công trên web
+
 jobs:
   inspect:
     runs-on: ubuntu-latest
