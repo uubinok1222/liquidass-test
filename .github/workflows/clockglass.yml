@@ -703,6 +703,8 @@ jobs:
           ClockGlass is based on Liquid (Gl)ass by dylv (winaviation-tweaks/liquidass). See LICENSE for the upstream license terms. Modified: reduced to the lock screen clock, per-wallpaper styles, editor controls, identifiers renamed.
           XCEOF
 
+          find . -type f -name '*.x' -not -path './.git/*' -print0 | xargs -0 perl -pi -e 's/^(\s*[-+]\s*\([^)]*\)[^{}]*?)\{(.*)\}\s*$/$1\{\n$2\n\}\n/ unless m{^\s*//}'
+
           echo "== leftover dylv =="; grep -rIn "dylv" . 2>/dev/null | grep -v '^./.git/' | grep -v LICENSE | grep -v NOTICES | head -20 || true
           echo "== tree =="; find . -type f -not -path './.git/*' | sort | head -80
           zip -qr /tmp/source.zip . -x '.git/*'
@@ -747,8 +749,12 @@ jobs:
       - name: build
         run: |
           make clean || true
-          make package ARCHS="arm64 arm64e" TARGET="$DEVICE_TARGET" FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
-
+          set +e
+          make package -k ARCHS="arm64 arm64e" TARGET="$DEVICE_TARGET" FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide 2>&1 | tee /tmp/build.log
+          st=${PIPESTATUS[0]}
+          echo "===== ERRORS ====="
+          grep -E "error:|undefined|ld: " /tmp/build.log | sort -u | head -60
+          exit $st
       - name: upload deb
         uses: actions/upload-artifact@v4
         with:
