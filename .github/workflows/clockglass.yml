@@ -63,6 +63,7 @@ jobs:
           patch($clock, qr{static void LGClockHostDidLayout\(UIView \*host\) \{}, L('static void LGClockHostDidLayout(UIView *host) {', '    XCSyncHostTransform(host);'), 1);
 
           my $gk = 'Shared/LGGlassKit.x';
+          patch($gk, qr{%hook MTMaterialView.*?\n%end}s, '', 1);
           patch($gk, qr{BOOL lgHostEnabled\(NSString \*prefix\) \{},
             L('BOOL lgHostEnabled(NSString *prefix) {',
               '    if (prefix.length && ![prefix isEqualToString:@"Clock"] && ![prefix isEqualToString:@"Global"]) return NO;'), 1);
