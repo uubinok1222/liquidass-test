@@ -102,7 +102,7 @@ jobs:
           mv LiquidAssBackboardd ClockGlassBackboardd
           mv ClockGlassBackboardd/LiquidAssBackboardd.plist ClockGlassBackboardd/ClockGlassBackboardd.plist
           rm -f liquidass.plist
-          find . -type f \( -name '*.x' -o -name '*.xm' -o -name '*.m' -o -name '*.mm' -o -name '*.h' -o -name 'Makefile' \) -not -path './.git/*' -not -path './.github/*' -print0 | xargs -0 perl -pi -e 's/dylv\.liquidassprefs/xc.clockglass.prefs/g; s/dylv\.liquidglass/xc.clockglass/g; s/dylv\.liquidass/xc.clockglass/g; s/liquidglass-clock-mask-shared/clockglass-clock-mask/g; s/liquidass-backboardd/clockglass-backboardd/g; s/liquidass-safemode/clockglass-safemode/g; s/liquidglass\.log/clockglass.log/g; s/LiquidAssBackboardd/ClockGlassBackboardd/g; s/Liquid \(Gl\)ass/ClockGlass/g; s/LiquidAss(?!Prefs)/ClockGlass/g; s/(?<![A-Za-z0-9])([ks]?)LG(?=[A-Za-z0-9_])/${1}XC/g; s/(?<![A-Za-z0-9])lg(?=[A-Z])/xc/g;'
+          find . -type f \( -name '*.x' -o -name '*.xm' -o -name '*.m' -o -name '*.mm' -o -name '*.h' -o -name 'Makefile' \) -not -path './.git/*' -not -path './.github/*' -print0 | xargs -0 perl -pi -e 's/dylv\.liquidassprefs/xc.clockglass.prefs/g; s/dylv\.liquidglass/xc.clockglass/g; s/dylv\.liquidass/xc.clockglass/g; s/liquidglass-clock-mask-shared/clockglass-clock-mask/g; s/liquidass-backboardd/clockglass-backboardd/g; s/liquidass-safemode/clockglass-safemode/g; s/liquidglass\.log/clockglass.log/g; s/LiquidAssBackboardd/ClockGlassBackboardd/g; s/Liquid \(Gl\)ass/ClockGlass/g; s/LiquidAss(?!Prefs)/ClockGlass/g; s/(?<![A-Za-z0-9])([ks]?)LG(?=[A-Za-z0-9_])/${1}XC/g; s/(?<![A-Za-z0-9])lg(?=[A-Z])/xc/g; s/\bsetLg(?=[A-Z])/setXc/g;'
 
           cat > Shared/XCStyle.h <<'XCEOF'
           #pragma once
@@ -665,7 +665,7 @@ jobs:
 
           clockglass_FILES = Tweak.x $(wildcard Hooks/*.x) $(wildcard Shared/*.[xm])
           XCEXTRA
-          clockglass_CFLAGS = -fobjc-arc
+          clockglass_CFLAGS = -fobjc-arc -Wno-error -Wno-unused-property-ivar -Wno-arc-performSelector-leaks -Wno-unused-function
           clockglass_USE_MODULES = 0
           clockglass_FRAMEWORKS = UIKit QuartzCore CoreText CoreGraphics CoreMotion
           ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
