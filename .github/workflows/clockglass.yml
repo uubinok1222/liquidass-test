@@ -717,9 +717,17 @@ jobs:
 
       - name: editor patch
         run: |
+          set -e
           cp patch/XCEditor.x Hooks/XCEditor.x
-          perl -pi -e 's/sEditing = \(uuid != nil\);/sEditing = YES;/; s/if \(!sEditing \|\| !sEdit\.valid\) return;/if (!sEditing || !sEdit.valid || sEditHash == 0) return;/' Shared/XCStyle.m
-          grep -c "sEditing = YES" Shared/XCStyle.m
+          cp patch/XCStyle.m Shared/XCStyle.m
+          cp patch/XCStyle.h Shared/XCStyle.h
+          mkdir -p layout/Library/ClockGlass
+          git show HEAD:LiquidAssPrefs/Resources/SFAdaptiveSoftNumeric-VF.otf > layout/Library/ClockGlass/SFAdaptiveSoftNumeric-VF.otf
+          ls -l layout/Library/ClockGlass
+          perl -pi -e 's#/Library/PreferenceBundles/LiquidAssPrefs\.bundle/SFAdaptiveSoftNumeric-VF\.otf#/Library/ClockGlass/SFAdaptiveSoftNumeric-VF.otf#g' Hooks/Clock.x
+          grep -n "ClockGlass/SFAdaptive" Hooks/Clock.x
+          grep -rln "XCStylePreferenceOverride" Shared
+          test "$(grep -rl 'XCStylePreferenceOverride' Shared | wc -l)" -ge 4
 
       - name: setup theos
         uses: actions/checkout@v4
