@@ -715,6 +715,12 @@ jobs:
           name: source-${{ matrix.variant }}
           path: /tmp/source.zip
 
+      - name: editor patch
+        run: |
+          cp patch/XCEditor.x Hooks/XCEditor.x
+          perl -pi -e 's/sEditing = \(uuid != nil\);/sEditing = YES;/; s/if \(!sEditing \|\| !sEdit\.valid\) return;/if (!sEditing || !sEdit.valid || sEditHash == 0) return;/' Shared/XCStyle.m
+          grep -c "sEditing = YES" Shared/XCStyle.m
+
       - name: setup theos
         uses: actions/checkout@v4
         with:
